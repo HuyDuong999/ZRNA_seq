@@ -1,0 +1,1334 @@
+#!/usr/bin/env python3
+"""
+RNA-Seq Analysis Pipeline
+Designed for:
+  - Stranded Zymo-Seq Total RNA-Seq
+  - Non-Stranded Smart-seq2 Nextera XT RNA-Seq
+Developed by ZB Lab (SBS, NTU)
+"""
+# Standard Library Imports
+import os
+import sys
+import re
+import shutil
+import logging
+import zipfile
+import tarfile
+import csv
+import subprocess
+import argparse
+import shlex
+from pathlib import Path
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from typing import Dict
+
+# Third-Party Library Imports
+import pandas as pd
+
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("library/pipeline.log", mode="w")])
+
+logging.info("Pipeline initialized successfully.")
+
+def parse_arguments():
+    """
+    Parse command-line arguments for the RNA-Seq pipeline script.
+    Returns:
+        argparse.Namespace: Parsed arguments as a namespace object.
+    """
+    parser = argparse.ArgumentParser(description="ZB Lab (SBS. NTU) - RNA-Seq Pipeline Script")
+
+    # Argument Definitions
+    parser.add_argument('-lib', '--library',
+        choices=['stranded', 'non_stranded'], required=True,
+        help="Specify the library type ('stranded' or 'non_stranded').")
+    parser.add_argument('-@', '--thread', type=int, default=6,
+        help="Number of CPU threads to use (default: 6).")
+    parser.add_argument('-q', '--query', type=str, required=True,
+        help="Path to the folder containing all raw files.")
+    parser.add_argument('-a', '--adapter', type=str,
+        help="Path to the file with adapter sequences for each sample.")
+    parser.add_argument('-r', '--reference', type=str, required=True,
+        help=("Specify the available genome ('pf_3d7', 'pk_a1h1', 'pk_h', 'pv_p01', 'monkey', 'human')."
+            "Or provide a custom reference name for creation with --ref_fasta and --ref_gff."))
+    parser.add_argument('-st', '--step', choices=['all', 'trim', 'map', 'assemble', 'cleanup'], default='all',
+        help="Step to run from (default: 'all').")
+    parser.add_argument('-rc', '--raw_count', choices=['yes', 'no'], default='no',
+        help="Read count requirement ('yes' or 'no', default: 'no').")
+    parser.add_argument('-c', '--classification', choices=['yes', 'no'], default='no',
+        help="Novel transcript classification requirement ('yes' or 'no', default: 'no').")
+    parser.add_argument('-m', '--min_overlap', type=int, default=50,
+        help="Minimum overlap required for transcript classification (default: 50).")
+    parser.add_argument('-o', '--output', type=str, default='./output',
+        help="Path to the output directory (default: './output').")
+    parser.add_argument('-rq', '--ref_fasta', type=str,
+        help="Path to the FASTA file for reference genome creation.")
+    parser.add_argument('-rg', '--ref_gff', type=str,
+        help="Path to the GFF file for reference genome creation.")
+    parser.add_argument('-v', '--version', action='store_true',
+        help="Display the version of the script and exit.")
+    parser.add_argument('-V', '--verbose', action='store_true',
+        help="Enable verbose mode to display error messages during execution.")
+
+    # Parse Arguments
+    args = parser.parse_args()
+
+    # Handle Version Display
+    if args.version:
+        print("ZB Lab (SBS, NTU)- RNA-Seq Pipeline Script\nVersion: 1.0\nLast updated: Jan 2025")
+        sys.exit(0)
+
+    return args
+
+def clean_directories(directories):
+    """
+    Remove the specified directories if they exist.
+    Args:
+        directories (list): List of directory paths to be removed.
+    """
+    for directory in directories:
+        if os.path.exists(directory):
+            try:
+                shutil.rmtree(directory)
+                logging.info(f"Successfully removed directory: {directory}")
+            except Exception as e:
+                logging.error(f"Failed to remove directory {directory}: {e}")
+
+def move_items(directory, destination):
+    """
+    Move all items from a directory to a destination.
+    Args:
+        directory (str): Path to the source directory.
+        destination (str): Path to the destination directory.
+    """
+    if os.path.exists(directory):
+        for item in os.listdir(directory):
+            source = os.path.join(directory, item)
+            dest = os.path.join(destination, item)
+            try:
+                shutil.move(source, dest)
+                logging.info(f"Moved {item} from {directory} to {destination}")
+            except Exception as e:
+                logging.error(f"Error moving {item} from {directory} to {destination}: {e}")
+        # Remove directory if empty
+        if not os.listdir(directory):
+            try:
+                shutil.rmtree(directory)
+                logging.info(f"Removed empty directory: {directory}")
+            except Exception as e:
+                logging.error(f"Failed to remove directory {directory}: {e}")
+
+def check_points(output, step):
+    """
+    Manage directory cleanup and define enabled pipeline steps based on the given step.
+    Args:
+        output (str): Output directory path.
+        step (str): Pipeline step to start from ("all", "trim", "map", "assemble", "cleanup").
+    Returns:
+        tuple: Boolean flags for each pipeline step (all, trim, map, assemble, cleanup).
+    """
+    logging.info(f"Starting checkpoint checks with output: {output} and step: {step}")
+
+    # Validate step
+    steps_enabled = {"all": True, "trim": True, "map": True, "assemble": True, "cleanup": True}
+    steps_directories = {
+        "all": ["0_raw_reads", "1_trim", "2_map", "3_assembly", "4_count", "5_classification"],
+        "trim": ["1_trim", "2_map", "3_assembly", "4_count", "5_classification"],
+        "map": ["2_map", "3_assembly", "4_count", "5_classification"],
+        "assemble": ["3_assembly", "4_count", "5_classification"],
+        "cleanup": []}
+    if step not in steps_enabled:
+        raise ValueError(f"Invalid step '{step}'. Choose from {list(steps_enabled.keys())}.")
+
+    # Move output files to the current directory
+    move_items(output, ".")
+    logging.info(f"Moved files from {output} to current directory.")
+
+    # Clean necessary directories
+    clean_directories(steps_directories[step])
+    logging.info(f"Cleaned directories for step '{step}': {steps_directories[step]}")
+
+    # Enable/disable steps
+    for key in steps_enabled.keys():
+        if key == step:
+            break
+        steps_enabled[key] = False
+    logging.info(f"Pipeline step configuration: {steps_enabled}")
+
+    return (steps_enabled["all"], steps_enabled["trim"], steps_enabled["map"],
+            steps_enabled["assemble"], steps_enabled["cleanup"])
+
+def extract_files(directory: str, max_cores: int):
+    """
+    Extract all archive files (.zip, .tar, .tar.gz, etc.) in a directory.
+    Args:
+        directory (str): Path to the directory containing archive files.
+        max_cores (int): Maximum number of cores to use for parallel extraction.
+    """
+    directory = Path(directory)
+
+    def extract(archive_file: Path):
+        try:
+            extract_path = archive_file.parent
+            logging.info(f"Extracting: {archive_file} to {extract_path}")
+            if archive_file.suffix == '.zip':
+                with zipfile.ZipFile(archive_file, 'r') as zip_ref:
+                    zip_ref.extractall(extract_path)
+            elif archive_file.suffix in {'.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz'}:
+                with tarfile.open(archive_file, 'r') as tar_ref:
+                    tar_ref.extractall(extract_path)
+            else:
+                logging.warning(f"Unsupported file type: {archive_file}")
+        except Exception as e:
+            logging.error(f"Error extracting {archive_file}: {e}")
+
+    # Find all supported archive files
+    archive_files = [file for file in directory.rglob('*') if file.suffix in {'.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz'}]
+    logging.info(f"Found {len(archive_files)} archive files to extract.")
+
+    # Use ProcessPoolExecutor for parallel extraction
+    with ProcessPoolExecutor(max_workers=max_cores) as executor:
+        executor.map(extract, archive_files)
+
+def process_directory(parent_dir: Path, output_dir: Path):
+    """
+    Process a directory containing .fq.gz files by renaming or concatenating files.
+    Args:
+        parent_dir (Path): Path to the directory containing the .fq.gz files.
+        output_dir (Path): Path to the directory where processed files will be stored.
+    """
+    dir_name = parent_dir.name
+    fq_files = list(parent_dir.glob("*.fq.gz"))
+
+    try:
+        if len(fq_files) == 2:
+            # Move paired files
+            subprocess.run(f"mv {parent_dir}/*1.fq.gz {output_dir}/{dir_name}_1.fq.gz", shell=True, check=True)
+            subprocess.run(f"mv {parent_dir}/*2.fq.gz {output_dir}/{dir_name}_2.fq.gz", shell=True, check=True)
+            logging.info(f"Moved files for directory: {dir_name}")
+        else:
+            # Concatenate files
+            subprocess.run(f"cat {parent_dir}/*1.fq.gz > {output_dir}/{dir_name}_1.fq.gz", shell=True, check=True)
+            subprocess.run(f"cat {parent_dir}/*2.fq.gz > {output_dir}/{dir_name}_2.fq.gz", shell=True, check=True)
+            logging.info(f"Concatenated files for directory: {dir_name}")
+        
+        # Remove the original directory after processing
+        subprocess.run(f"rm -r {parent_dir}", shell=True, check=True)
+    except Exception as e:
+        logging.error(f"Error processing directory {parent_dir}: {e}")
+
+def relocate_files(directory: str, output_dir: str, max_cores: int):
+    """
+    Relocate and process all .fq.gz files from subdirectories to a target directory.
+    Args:
+        directory (str): Path to the root directory containing subdirectories with .fq.gz files.
+        output_dir (str): Path to the target directory for relocated and processed files.
+        max_cores (int): Maximum number of cores to use for parallel processing.
+    """
+    directory = Path(directory)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # Get unique parent directories containing .fq.gz files
+    parent_dirs = {fq_file.parent for fq_file in directory.rglob("*.fq.gz")}
+    logging.info(f"Found {len(parent_dirs)} directories to process.")
+
+    # Use ProcessPoolExecutor for parallel processing
+    with ProcessPoolExecutor(max_workers=max_cores) as executor:
+        executor.map(partial(process_directory, output_dir=output_dir), parent_dirs)
+
+def generate_adapter(udi_list: str, sample_udi: str) -> dict:
+    """
+    Generate adapter sequences for samples based on UDI list and sample UDI mapping.
+    Args:
+        udi_list (str): Path to the CSV file containing UDI to i7_r1 and i5_r2 mappings.
+        sample_udi (str): Path to the CSV file containing sample names and their corresponding UDI.
+    Returns:
+        dict: Mapping of sample names to their adapter sequences.
+    """
+    udi_map = {}
+    adapter = {}
+    
+    try:
+        with open(udi_list, "r") as file:
+            for line in file.readlines()[1:]:  # Skip header
+                udi, i7_r1, i5_r2 = line.strip().split(",")
+                udi_map[udi] = [i7_r1, i5_r2]
+    except Exception as e:
+        logging.error(f"Error reading UDI list file {udi_list}: {e}")
+        return {}
+
+    try:
+        with open(sample_udi, "r") as file:
+            for line in file.readlines()[1:]:  # Skip header
+                sample, udi = line.strip().split(",")
+                if udi in udi_map:
+                    adapter[sample] = (f"AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC{udi_map[udi][0]}ATCTCGTATGCCGTCTTCTGCTTG",
+                        f"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT{udi_map[udi][1]}GTGTAGATCTCGGTGGTCGCCGTATCATT")
+                else:
+                    logging.warning(f"UDI {udi} for sample {sample} not found in UDI list.")
+    except Exception as e:
+        logging.error(f"Error reading sample UDI file {sample_udi}: {e}")
+    
+    return adapter
+
+def adapter_extract(sample_adapter: str, library: str, sample_dir: str) -> dict:
+    """
+    Extract adapter sequences for a given library type from the sample adapter file.
+    Args:
+        sample_adapter (str): Path to the CSV file containing sample and adapter sequences.
+        library (str): Type of library (either 'stranded' or 'non_stranded').
+        sample_dir (str): Directory containing the sample files.
+    Returns:
+        dict: Mapping of sample names to their adapter sequences.
+    """
+    sample_dir = Path(sample_dir)
+    sample_list = sorted({entry[:-8] for entry in os.listdir(sample_dir)})  # Assume filename ends with "_1.fq.gz" or "_2.fq.gz"
+    adapter = {}
+
+    if sample_adapter:
+        try:
+            with open(sample_adapter, "r") as file:
+                for line in file.readlines()[1:]:  # Skip header
+                    sample, i7_r1, i5_r2 = line.strip().split(",")
+                    if library == 'stranded':
+                        adapter[sample] = (f"AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC{i7_r1}ATCTCGTATGCCGTCTTCTGCTTG",
+                            f"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT{i5_r2}GTGTAGATCTCGGTGGTCGCCGTATCATT")
+                    elif library == "non_stranded":
+                        adapter[sample] = (f"CTGTCTCTTATACACATCTCCGAGCCCACGAGAC{i7_r1}ATCTCGTATGCCGTCTTCTGCTTG",
+                            f"CTGTCTCTTATACACATCTGACGCTGCCGACGA{i5_r2}GTGTAGATCTCGGTGGTCGCCGTATCATT")
+        except Exception as e:
+            logging.error(f"Error reading sample adapter file {sample_adapter}: {e}")
+            return {}
+    else:
+        # Default adapters for all samples if no adapter file provided
+        for sample in sample_list:
+            if library == 'stranded':
+                adapter[sample] = ("AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC", "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT")
+            elif library == "non_stranded":
+                adapter[sample] = ("CTGTCTCTTATACACATCT", "CTGTCTCTTATACACATCT")
+    
+    return adapter
+
+def trimming(adapter, input_dir: str, output_dir: str, trim_script: str, library: str):
+    """
+    Generate trimming commands for sequencing data based on the specified library type and adapter sequences.
+    Args:
+        adapter (dict): A dictionary of sample names to their respective adapter sequences.
+        input_dir (str): Directory containing the raw input files.
+        output_dir (str): Directory where the trimmed output files will be saved.
+        trim_script (str): Path to the script where trimming commands will be written.
+        library (str): Type of library ('stranded' or 'non_stranded').
+    Returns:
+        str: Path to the trim script file.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    try:
+        with open(trim_script, "w") as w:
+            for sample, adapter_seq in adapter.items():
+                file_1, file_2 = f"{input_dir}/{sample}_1.fq.gz", f"{input_dir}/{sample}_2.fq.gz"
+                if os.path.exists(file_1) and os.path.exists(file_2):
+                    if library == 'stranded':
+                        w.write(f"trim_galore -q 30 --phred33 --clip_R2 10 -a NNNNNNNNNN{adapter_seq[0]} -a2 {adapter_seq[1]} --stringency 15 --trim-n -e 0.2 -o {output_dir} --length 75 --paired {file_1} {file_2}\n")
+                        w.write(f"trim_galore -q 30 --phred33 --trim-n -o {output_dir} --length 35 --paired {output_dir}/{sample}_1_val_1.fq.gz {output_dir}/{sample}_2_val_2.fq.gz\n")
+                        w.write(f"rm {output_dir}/{sample}_1_val_1.fq.gz {output_dir}/{sample}_2_val_2.fq.gz\n")
+                        w.write(f"mv {output_dir}/{sample}_1_val_1_val_1.fq.gz {output_dir}/{sample}_trimmed_1.fq.gz\n")
+                        w.write(f"mv {output_dir}/{sample}_2_val_2_val_2.fq.gz {output_dir}/{sample}_trimmed_2.fq.gz\n")
+                    elif library == "non_stranded":
+                        smartseq1 = "AAGCAGTGGTATCAACGCAGAGTACATGGG"
+                        smartseq2 = "CCCATGTACTCTGCGTTGATACCACTGCTT"
+                        w.write(f"trim_galore -q 20 --phred33 -a {adapter_seq[0]} -a2 {adapter_seq[1]} --stringency 5 --trim-n -e 0.2 -o {output_dir} --length 35 --paired {file_1} {file_2}\n")
+                        for n in range(1, 5):
+                            w.write(f"trim_galore -q 20 --phred33 -a {smartseq1} -a2 {smartseq2} --stringency 5 --trim-n -e 0.2 -o {output_dir} --length 35 --paired {output_dir}/{sample}{'_1_val'*n}_1.fq.gz {output_dir}/{sample}{'_2_val'*n}_2.fq.gz\n")
+                            w.write(f"rm {output_dir}/{sample}{'_1_val'*n}_1.fq.gz {output_dir}/{sample}{'_2_val'*n}_2.fq.gz\n")
+                        w.write(f"mv {output_dir}/{sample}{'_1_val'*(n+1)}_1.fq.gz {output_dir}/{sample}_trimmed_1.fq.gz\n")
+                        w.write(f"mv {output_dir}/{sample}{'_2_val'*(n+1)}_2.fq.gz {output_dir}/{sample}_trimmed_2.fq.gz\n")
+                    else:
+                        logging.warning(f"Warning: Library type '{library}' is not recognized for {sample}.")
+                else:
+                    logging.warning(f"Warning: {file_1} or {file_2} not found for {sample}.")
+    except Exception as e:
+        logging.error(f"Error writing trim script: {e}")
+    
+    return trim_script
+
+def run_commands_in_parallel(file_path: str, max_cores: int, command_per_sample: int):
+    """
+    Executes trimming commands in parallel by dividing them into chunks based on the number of cores.
+    Args:
+        file_path (str): Path to the script containing the trimming commands.
+        max_cores (int): Maximum number of parallel processes.
+        command_per_sample (int): Number of commands to run per sample.
+    """
+    try:
+        with open(file_path, 'r') as file:
+            lines = [line.strip() for line in file if line.strip()]
+        samples = [lines[i:i + command_per_sample] for i in range(0, len(lines), command_per_sample)]
+
+        def run_sample(commands):
+            for command in commands:
+                try:
+                    logging.info(f"Running command: {command}")
+                    subprocess.run(command, shell=True, check=True)
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Error executing command: {command}\nError: {e}")
+                    return False
+            return True
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_cores) as executor:
+            futures = [executor.submit(run_sample, sample) for sample in samples]
+            for future in concurrent.futures.as_completed(futures):
+                if not future.result():
+                    logging.error("A sample failed to execute all commands.")
+    except Exception as e:
+        logging.error(f"Error running commands in parallel: {e}")
+
+def trimming_qc(input_dir: str, library: str):
+    """
+    Perform quality control (QC) for sequencing data after trimming and generate reports.
+    Args:
+        input_dir (str): Directory containing the QC files and sequencing data.
+        library (str): Type of library ('stranded' or 'non_stranded') to determine output format.
+    """
+    # Define patterns and corresponding output filenames for QC data
+    patterns = {"Reads with adapters:": "reads_with_adapter.txt",
+        "Reads written (passing filters):": "reads_written.txt",
+        "Quality-trimmed:": "bases_quality_trimmed.txt",
+        "Total written (filtered)": "bases_written.txt"}
+
+    # Process each QC pattern
+    for pattern, temp_file in patterns.items():
+        try:
+            # Run grep command to extract data
+            command = f"grep '{pattern}' {input_dir}/* | sort"
+            with open(f"{input_dir}/{temp_file}", 'w') as tempfile:
+                subprocess.run(command, shell=True, stdout=tempfile, text=True, check=True)
+
+            # Initialize a dictionary to store sample QC data
+            sample_qc = {}
+
+            # Read the extracted data and process it
+            with open(f"{input_dir}/{temp_file}", "r") as infile:
+                for line in infile:
+                    line = line.strip()
+                    value = line.split(" (")[-1].split(")")[0]
+                    if "_val" not in line:
+                        sample_name = line.split(".fq.gz")[0][7:]  # Extract sample name
+                        sample_qc[sample_name] = value
+                    else:
+                        sample_name = line.split("_val")[0][7:]  # Handle '_val' files
+                        sample_qc[sample_name] += f"\t{value}"
+
+            # Write the results to the output file
+            with open(f"{input_dir}/0_{temp_file}", "w") as outfile:
+                if library == 'stranded':
+                    outfile.write("Sample\tSpecified_trim\tIllumina_trim\n")
+                elif library == 'non_stranded':
+                    outfile.write("Sample\tSpecified_trim\tSMARTseq_trim_1\tSMARTseq_trim_2\tSMARTseq_trim_3\tSMARTseq_trim_4\n")
+                for key, value in sample_qc.items():
+                    outfile.write(f"{key}\t{value}\n")
+
+            # Clean up temporary file
+            os.remove(f"{input_dir}/{temp_file}")
+
+        except subprocess.CalledProcessError as e:
+            print(f"Error processing {temp_file}: {e}")
+        except Exception as e:
+            print(f"Unexpected error while processing {temp_file}: {e}")
+
+def generate_hisat2_reference(fasta_file, gff_file, ref_name, core):
+    """
+    Generates a HISAT2 reference genome and associated index files for RNA-seq analysis.
+    Args:
+        fasta_file (str): Path to the genome FASTA file.
+        gff_file (str): Path to the genome annotation GFF file.
+        ref_name (str): Name for the reference genome (used for directory and file naming).
+        core (int): Number of CPU cores to use for the HISAT2 index creation process.
+    """
+
+    ref_dir = Path(f"./reference/{ref_name}")
+    ref_dir.mkdir(parents=True, exist_ok=True)  # Create the reference directory if it doesn't exist
+    
+    # Define paths for FASTA and GFF files
+    fasta_path = ref_dir / Path(fasta_file).name
+    gff_path = ref_dir / f"{ref_name}.gff"
+    
+    # Ensure the input files exist before renaming
+    if not Path(fasta_file).exists():
+        raise FileNotFoundError(f"FASTA file '{fasta_file}' not found.")
+    if not Path(gff_file).exists():
+        raise FileNotFoundError(f"GFF file '{gff_file}' not found.")
+    
+    # Rename and move the input files to the reference directory
+    Path(fasta_file).rename(fasta_path)
+    Path(gff_file).rename(gff_path)
+
+    # Paths for the GTF, splice site, and exon files
+    gtf_path = ref_dir / f"{ref_name}.gtf"
+    splice_sites_path = ref_dir / f"{ref_name}.ss"
+    exons_path = ref_dir / f"{ref_name}.exon"
+
+    # Convert GFF to GTF using gffread
+    subprocess.run(["gffread", str(gff_path), "-T", "-o", str(gtf_path)], check=True)
+    
+    # Extract splice sites and exons using hisat2 scripts
+    subprocess.run(shlex.split(f"hisat2_extract_splice_sites.py {gtf_path} > {splice_sites_path}"), check=True)
+    subprocess.run(shlex.split(f"hisat2_extract_exons.py {gtf_path} > {exons_path}"), check=True)
+    
+    # Build the reference using hisat2-build with the extracted splice sites and exons
+    subprocess.run(["hisat2-build", "-p", str(core), "--ss", str(splice_sites_path), "--exon", str(exons_path),
+                    str(fasta_path), str(ref_dir / ref_name)], check=True)
+
+    # Filter the GFF file to only include mRNA entries
+    output_gff = ref_dir / f"{ref_name}_RNA.gff"
+    with open(gff_path, "r") as infile, open(output_gff, "w") as outfile:
+        for line in infile:
+            columns = line.split("\t")
+            if len(columns) > 2 and columns[2] == "mRNA":  # Only write mRNA entries
+                outfile.write(line)
+
+def create_and_run_mapping_script(input_dir: str, output_dir: str, script_path: str, reference: str, core: int, library: str):
+    """
+    Generates and executes a mapping script for RNA-seq data using hisat2 and samtools.
+    Args:
+        input_dir (str): Directory containing trimmed input fastq files.
+        output_dir (str): Directory to store output files.
+        script_path (str): Path where the generated script will be saved.
+        reference (str): Path to the reference genome.
+        core (int): Number of cores for parallelization.
+        library (str): Type of library ('stranded' or 'non_stranded').
+    """
+    input_dir, output_dir = Path(input_dir), Path(output_dir)
+    output_dir.mkdir(exist_ok=True)  # Ensure output directory exists
+
+    with open(script_path, "w") as w:
+        for entry in os.listdir(input_dir):
+            if "_trimmed_1.fq.gz" in entry:  # Only process trimmed files
+                sample = entry[:-16]  # Get sample name
+                read1 = input_dir / entry
+                read2 = input_dir / entry.replace("1.fq.gz", "2.fq.gz")
+
+                if read1.exists() and read2.exists():  # Check if both paired-end files exist
+                    if library == 'stranded':
+                        w.write(f"hisat2 --dta -S {output_dir}/{sample}.sam --summary-file {output_dir}/{sample}.summ "
+                                f"--min-intronlen 20 --max-intronlen 3000 -x reference/{reference}/{reference} "
+                                f"--rna-strandness RF -1 {read1} -2 {read2} -p {core}\n")
+                        w.write(f"samtools view -@ {core} -b -o {output_dir}/{sample}.bam {output_dir}/{sample}.sam\n")
+                        w.write(f"rm {output_dir}/{sample}.sam\n")
+                        w.write(f"samtools view -@ {core} -H {output_dir}/{sample}.bam > {output_dir}/{sample}.unq.sam\n")
+                        w.write(f"samtools view -@ {core} -F 4 {output_dir}/{sample}.bam | grep 'NH:i:[123]' | "
+                                f"grep -v NH:i:10 >> {output_dir}/{sample}.unq.sam\n")
+                        w.write(f"samtools sort -@ {core} {output_dir}/{sample}.unq.sam -o {output_dir}/{sample}.unq.bam\n")
+                        w.write(f"rm {output_dir}/{sample}.unq.sam\n")
+                    elif library == 'non_stranded':
+                        w.write(f"hisat2 -S {output_dir}/{sample}.sam --summary-file {output_dir}/{sample}.summ "
+                                f"--min-intronlen 20 --max-intronlen 3000 -x reference/{reference}/{reference} "
+                                f"-1 {read1} -2 {read2} --fr -p {core}\n")
+                        w.write(f"samtools view -@ {core} -b -o {output_dir}/{sample}.bam {output_dir}/{sample}.sam\n")
+                        w.write(f"rm {output_dir}/{sample}.sam\n")
+                        w.write(f"samtools view -@ {core} -H {output_dir}/{sample}.bam > {output_dir}/{sample}.unq.sam\n")
+                        w.write(f"samtools view -@ {core} -f 2 {output_dir}/{sample}.bam | fgrep -w NH:i:1 >> {output_dir}/{sample}.unq.sam\n")
+                        w.write(f"samtools sort -n -@ {core} {output_dir}/{sample}.unq.sam -o {output_dir}/{sample}.unq.bam\n")
+                        w.write(f"rm {output_dir}/{sample}.unq.sam\n")
+                        w.write(f"bamToBed -bedpe -i {output_dir}/{sample}.unq.bam > {output_dir}/{sample}.unq.bed\n")
+                        w.write(f"rm {output_dir}/{sample}.unq.bam\n")
+                        w.write(f"coverageBed -a reference/{reference}/{reference}_RNA.gff -b {output_dir}/{sample}.unq.bed > {output_dir}/{sample}.unq.cov\n")
+                        w.write(f"rm {output_dir}/{sample}.unq.bed\n")
+
+    # Execute the generated script
+    try:
+        subprocess.run(["bash", script_path], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error occurred while executing the script: {e}")
+
+def generate_mapping_summary(input_dir: str, output_file: str) -> None:
+    """
+    Generate a summary of mapping statistics from input directory.
+    Args:
+        input_dir (str): Path to the directory containing `.summ` files.
+        output_file (str): Path to the output CSV file to save the summary.
+    Returns:
+        None: Writes the summary to the specified output file.
+    """
+    input_dir = Path(input_dir)
+    output_file = Path(output_file)
+
+    # Define the header for the output CSV file
+    header = ("Sample,Total_read_pairs,Uniquely_aligned_pairs,Multi_aligned_pairs,"
+        "Discordantly_aligned_pairs,Uniquely_aligned_unpaired_mates,"
+        "Multi_aligned_unpaired_mates,Unmapped_unpaired_mates,Overall_alignment_rate\n")
+
+    # Open the output file for writing
+    with output_file.open("w") as output_csv:
+        output_csv.write(header)  # Write the header
+
+        # Iterate over all `.summ` files in the input directory
+        for entry in input_dir.iterdir():
+            if entry.suffix == ".summ":
+                try:
+                    # Read the file and extract relevant information
+                    with entry.open("r") as infile:
+                        lines = infile.readlines()
+                    
+                        # Extract sample name (remove the `.summ` extension)
+                        sample_name = entry.stem
+                        row_data = [sample_name]
+    
+                        # Relevant line indices to extract data from
+                        relevant_lines = [0, 3, 4, 7, 12, 13, 11, 14]
+    
+                        # Extract the required values
+                        for idx in relevant_lines:
+                            value = lines[idx].split()[0]
+                            row_data.append(value)
+    
+                        # Write the row to the output CSV file
+                        output_csv.write(",".join(row_data) + "\n")
+
+                except (IndexError, FileNotFoundError, IOError) as e:
+                    print(f"Error processing file {entry.name}: {e}")
+
+def fpkm_cal(directory: str) -> None:
+    """
+    Calculate FPKM values for each sample in the specified directory.
+    Args:
+        directory (str): Path to the directory containing `.summ` and `.unq.cov` files.
+    Returns:
+        None: Writes FPKM values to a new file for each sample.
+    """
+    directory = Path(directory)
+
+    # Iterate over all `.summ` files in the directory
+    for file in directory.iterdir():
+        if file.suffix == ".summ":
+            try:
+                # Read the unique alignment count from the `.summ` file
+                unique_count = None
+                with file.open("r") as infile_1:
+                    for line in infile_1:
+                        if "aligned concordantly exactly 1 time" in line:
+                            unique_count = line.split('(')[0].strip()
+                            unique_count = int(unique_count)
+                            break
+
+                if unique_count is None:
+                    raise ValueError(f"Unique alignment count not found in {file.name}")
+
+                # Extract sample name from the `.summ` file name
+                sample_name = file.stem
+
+                # Open the output file for FPKM values
+                output_file = directory / f"{sample_name}.fpkm.txt"
+                with output_file.open("w") as outfile_1:
+                    # Write the header
+                    outfile_1.write(f"geneid\t{sample_name}\n")
+
+                    # Open the corresponding `.unq.cov` file
+                    cov_file = directory / f"{sample_name}.unq.cov"
+                    if not cov_file.exists():
+                        raise FileNotFoundError(f"{cov_file.name} is missing")
+
+                    with cov_file.open("r") as infile_2:
+                        for line in infile_2:
+                            line = line.strip()
+                            columns = line.split('\t')
+
+                            # Extract gene ID and calculate FPKM
+                            gene_info = columns[8].split(';')
+                            gene_id = gene_info[0].replace('ID=', '')
+
+                            try:
+                                read_count = float(columns[9])
+                                gene_length = float(columns[10])
+                                if gene_length != 0:
+                                    fpkm_value = (read_count / gene_length / unique_count) * 1e9
+                                else:
+                                    fpkm_value = "NA"
+                            except (ValueError, IndexError) as e:
+                                fpkm_value = "NA"
+
+                            # Write the gene ID and FPKM value to the output file
+                            outfile_1.write(f"{gene_id}\t{fpkm_value}\n")
+
+            except Exception as e:
+                print(f"Error processing file {file.name}: {e}")
+
+def calculate_fpkm_and_summarize(directory: str, summary_file: str) -> None:
+    """
+    Calculate FPKM values for all samples and summarize the results into a single file.
+    Args:
+        directory (str): Path to the directory containing `.fpkm.txt` files.
+        summary_file (str): Path to the output summary file.
+    Returns:
+        None: Writes a summary file containing FPKM values for all transcripts.
+    """
+    directory = Path(directory)
+    summary_path = Path(summary_file)
+
+    # Call fpkm_cal to generate individual FPKM files
+    fpkm_cal(directory)
+
+    # Initialize summary data structures
+    header = ["Sample"]
+    transcript_data: Dict[str, list] = {}
+
+    # Read FPKM files and aggregate data
+    for fpkm_file in directory.glob("*.fpkm.txt"):
+        sample_name = fpkm_file.stem.replace(".fpkm", "")
+        header.append(sample_name)
+
+        try:
+            with fpkm_file.open("r") as file:
+                lines = file.readlines()
+
+                for line in lines[1:]:  # Skip header
+                    transcript_id, fpkm_value = line.rstrip().split("\t")
+                    if transcript_id not in transcript_data:
+                        transcript_data[transcript_id] = ["NA"] * (len(header) - 2)
+                    transcript_data[transcript_id].append(fpkm_value)
+        except Exception as e:
+            print(f"Error processing file {fpkm_file.name}: {e}")
+
+    # Report missing FPKM values with "Error" for samples without a transcript
+    for transcript_id, values in transcript_data.items():
+        if len(values) < len(header) - 1:
+            values.extend(["Error"] * (len(header) - 1 - len(values)))
+
+    # Write the summarized data to the output file
+    with summary_path.open("w") as output_file:
+        # Write header
+        output_file.write(",".join(header) + "\n")
+
+        # Write transcript data
+        for transcript_id, fpkm_values in transcript_data.items():
+            output_file.write(f"{transcript_id},{','.join(fpkm_values)}\n")
+
+def extract_gene_lengths(gff_file: str, output_file: str) -> None:
+    """
+    Extract gene lengths from a GFF file and save the results to a CSV file.
+    Args:
+        gff_file (str): Path to the GFF file containing gene annotations.
+        output_file (str): Path to the output CSV file.
+    Returns:
+        None: Writes gene lengths to the specified output file.
+    """
+    gff_file = Path(gff_file)
+    output_file = Path(output_file)
+    gene_lengths = {}
+
+    try:
+        # Read the GFF file line by line
+        with gff_file.open("r") as file:
+            for line in file:
+                # Skip header or comment lines
+                if line.startswith("#"):
+                    continue
+
+                # Split the line into fields and validate
+                fields = line.strip().split("\t")
+                if len(fields) < 9:
+                    continue
+
+                # Process exon features to calculate gene lengths
+                if fields[2] == "exon":
+                    try:
+                        start = int(fields[3])
+                        end = int(fields[4])
+                        attributes = fields[8]
+
+                        # Extract the Parent ID from the attributes field
+                        parent_id = next((attr.split("=")[1] for attr in attributes.split(";") if attr.startswith("Parent=")), None)
+                        if parent_id:
+                            # Accumulate the length for the parent ID
+                            gene_lengths[parent_id] = gene_lengths.get(parent_id, 0) + (end - start + 1)
+
+                    except (ValueError, IndexError) as e:
+                        print(f"Skipping line due to error: {line.strip()} - {e}")
+                        continue
+
+        # Convert the gene lengths dictionary to a DataFrame
+        gene_lengths_df = pd.DataFrame(list(gene_lengths.items()), columns=["GeneID", "Length_bp"])
+
+        # Save the DataFrame to a CSV file
+        gene_lengths_df.to_csv(output_file, index=False)
+        print(f"Gene lengths successfully written to {output_file}")
+
+    except FileNotFoundError:
+        print(f"Error: The file {gff_file} does not exist.")
+    except PermissionError:
+        print(f"Error: Insufficient permissions to read {gff_file} or write to {output_file}.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def summarize_count_data(directory: str, output_file: str) -> None:
+    """
+    Summarize count data from multiple `.unq.cov` files into a single CSV file.
+    Args:
+        directory (str): Path to the directory containing `.unq.cov` files.
+        output_file (str): Path to the output summary CSV file.
+    Returns:
+        None: Writes the summarized data to the specified output file.
+    """
+    directory = Path(directory)
+    output_file = Path(output_file)
+
+    # Initialize data structures
+    count_data = {}
+    sample_names = []
+
+    # Collect `.unq.cov` files and sort them
+    unq_cov_files = sorted(directory.glob("*.unq.cov"))
+    if not unq_cov_files:
+        print(f"No `.unq.cov` files found in the directory: {directory}")
+        return
+
+    # Process each `.unq.cov` file
+    for file_path in unq_cov_files:
+        sample_name = file_path.stem.split(".")[0]
+        sample_names.append(sample_name)
+
+        with file_path.open("r") as file:
+            for line in file:
+                columns = line.strip().split("\t")
+                if len(columns) < 10:
+                    print(f"Skipping malformed line in file {file_path.name}: {line.strip()}")
+                    continue
+
+                try:
+                    gene_id = columns[8].split(";")[1][7:]  # Extract gene_id
+                    transcript_id = columns[8].split(";")[0][3:]  # Extract transcript_id
+                    count_value = columns[9]  # Extract count value
+
+                    # Create a unique key for gene_id and transcript_id
+                    key = (gene_id, transcript_id)
+
+                    # Append count value to the respective key
+                    if key not in count_data:
+                        count_data[key] = ['NA'] * (len(sample_names)-1)  # Placeholder for all samples
+                    count_data[key].append(count_value)  # Assign count value to the current sample
+                except IndexError:
+                    print(f"Skipping malformed attributes in line: {line.strip()}")
+
+    # Write summarized data to the output file
+    with output_file.open("w") as output:
+        # Write header
+        header = "gene_id,transcript_id," + ",".join(sample_names)
+        output.write(header + "\n")
+
+        # Write counts for each gene and transcript
+        for (gene_id, transcript_id), counts in count_data.items():
+            output.write(f"{gene_id},{transcript_id}," + ",".join(counts) + "\n")
+
+    print(f"Count summary successfully written to {output_file}")
+
+def calculate_tpm_fpkm(read_count_file: str, gene_length_file: str, output_file_tpm: str, output_file_fpkm: str) -> None:
+    """
+    Calculate TPM (Transcripts Per Million) and FPKM (Fragments Per Kilobase of transcript per Million mapped reads)
+    from read count and gene length data.
+    Args:
+        read_count_file (str): Path to the CSV file containing read counts for transcripts.
+        gene_length_file (str): Path to the CSV file containing gene lengths in base pairs.
+        output_file_tpm (str): Path to the output CSV file for TPM values.
+        output_file_fpkm (str): Path to the output CSV file for FPKM values.
+    Returns:
+        None: Writes TPM and FPKM values to their respective output files.
+    """
+    try:
+        # Load input files
+        read_counts = pd.read_csv(read_count_file).iloc[:, 1:]
+        read_counts = read_counts.set_index(read_counts.columns[0])
+        gene_lengths = pd.read_csv(gene_length_file, index_col=0)
+
+        # Ensure gene lengths are in kilobases
+        gene_lengths["Length_kb"] = gene_lengths["Length_bp"] / 1000
+
+        # Filter to keep only common genes in both datasets
+        common_genes = read_counts.index.intersection(gene_lengths.index)
+        if len(common_genes) == 0:
+            raise ValueError("No common genes found between read counts and gene lengths.")
+
+        read_counts = read_counts.loc[common_genes]
+        gene_lengths = gene_lengths.loc[common_genes]
+
+        # Calculate RPK (Reads Per Kilobase)
+        rpk = read_counts.div(gene_lengths["Length_kb"], axis=0)
+
+        # Calculate scaling factors for TPM and FPKM
+        total_mapped_reads = read_counts.sum(axis=0)  # Sum of all read counts per sample
+        scaling_factors_tpm = rpk.sum(axis=0)  # Sum of all RPK values per sample
+
+        # Calculate FPKM
+        fpkm = rpk.div(total_mapped_reads, axis=1) * 1e6
+
+        # Calculate TPM
+        tpm = rpk.div(scaling_factors_tpm, axis=1) * 1e6
+
+        # Save results to output files
+        fpkm.to_csv(output_file_fpkm, index_label="transcript_id")
+        tpm.to_csv(output_file_tpm, index_label="transcript_id")
+
+        print(f"TPM values successfully written to: {output_file_tpm}")
+        print(f"FPKM values successfully written to: {output_file_fpkm}")
+
+    except FileNotFoundError as e:
+        print(f"File not found: {e.filename}")
+    except pd.errors.EmptyDataError as e:
+        print(f"Input file is empty or malformed: {e}")
+    except KeyError as e:
+        print(f"Key error in input data: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def run_assembly_pipeline(map_dir: str, assembly_dir: str, 
+    expression_dir: str, reference: str, core: int) -> None:
+    """
+    Runs a transcriptome assembly and expression analysis pipeline using StringTie.
+    Args:
+        map_dir (str): Path to the directory containing input BAM files.
+        assembly_dir (str): Path to the directory where assembly outputs will be stored.
+        expression_dir (str): Path to the directory where expression outputs will be stored.
+        reference (str): Reference name (used to locate the GFF file in the reference folder).
+        core (int): Number of cores to use for StringTie operations.
+    Returns:
+        None: Executes the pipeline and writes outputs to the specified directories.
+    """
+    try:
+        # Convert directories to Path objects for consistency
+        map_dir, assembly_dir, expression_dir = Path(map_dir), Path(assembly_dir), Path(expression_dir)
+
+        # Create output directories if they do not exist
+        assembly_dir.mkdir(parents=True, exist_ok=True)
+        expression_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate assembly script
+        assembly_script_path = assembly_dir / "0_assembly.sh"
+        with open(assembly_script_path, "w") as assembly_script:
+            for bam_file in map_dir.glob("*.unq.bam"):
+                sample_name = bam_file.stem[:-4]  # Remove ".unq" from the stem
+                assembly_script.write(f"stringtie -p {core} --rf -G reference/{reference}/{reference}.gff "
+                    f"-o {assembly_dir}/{sample_name}_assembly.gtf {bam_file}\n")
+        subprocess.run(["bash", assembly_script_path], check=True)
+
+        # Merge assemblies
+        merge_list_path = assembly_dir / "1_mergelist.txt"
+        with open(merge_list_path, "w") as merge_list:
+            for gtf_file in assembly_dir.glob("*_assembly.gtf"):
+                merge_list.write(f"{gtf_file}\n")
+        subprocess.run(["stringtie", "--merge", "-p", str(core), "-G", f"reference/{reference}/{reference}.gff", 
+                "-o", f"{assembly_dir}/1_stringtie_merged.gtf", str(merge_list_path)], check=True)
+
+        # Generate expression analysis script
+        express_script_path = assembly_dir / "2_express.sh"
+        with open(express_script_path, "w") as express_script:
+            for bam_file in map_dir.glob("*.unq.bam"):
+                sample_name = bam_file.stem[:-4]
+                sample_expression_dir = expression_dir / sample_name
+                express_script.write(f"mkdir -p {sample_expression_dir}\n")
+                express_script.write(f"stringtie -e -B -p {core} -G {assembly_dir}/1_stringtie_merged.gtf "
+                    f"-o {sample_expression_dir}/{sample_name}_express.gtf {bam_file}\n")
+        subprocess.run(["bash", express_script_path], check=True)
+
+    except FileNotFoundError as e:
+        print(f"File or directory not found: {e.filename}")
+    except subprocess.CalledProcessError as e:
+        print(f"Error during subprocess execution: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def summarize_transcripts(input_dir: str, output_file: str) -> None:
+    """
+    Summarizes the number of annotated and novel transcripts from GTF files in the given directory.
+    Args:
+        input_dir (str): Path to the directory containing GTF files.
+        output_file (str): Path to the output CSV file where the summary will be written.
+    Returns:
+        None: Writes the summary to the specified output file.
+    """
+    try:
+        # Open output file for writing
+        with open(output_file, "w") as output:
+            output.write("Sample,No of annotated transcript,No of novel transcript\n")
+            
+            # Loop through GTF files in the input directory
+            for entry in os.listdir(input_dir):
+                if entry.endswith(".gtf"):
+                    file_path = os.path.join(input_dir, entry)
+                    
+                    annotated = 0
+                    novel = 0
+                    
+                    # Read the contents of the GTF file
+                    with open(file_path, "r") as gtf_file:
+                        for line in gtf_file:
+                            if "\ttranscript\t" in line:
+                                # Check if the transcript is annotated or novel
+                                if 'reference_id' in line or 'ref_gene_id' in line:
+                                    annotated += 1
+                                else:
+                                    novel += 1
+                    
+                    # Write the summary to the output file
+                    output.write(f"{entry},{annotated},{novel}\n")
+        
+        print(f"Transcript summary successfully written to {output_file}")
+    
+    except FileNotFoundError as e:
+        print(f"Error: The file or directory was not found - {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def process_expression_data(expression_dir: str) -> None:
+    """
+    Processes expression data from GTF files and generates CSV files for TPM and FPKM values.
+    Args:
+        expression_dir (str): Path to the directory containing expression data in GTF format.
+    Returns:
+        None: Writes TPM and FPKM data to CSV files in the same directory.
+    """
+    tpm_data = {}
+    fpkm_data = {}
+    samples = []
+
+    # Get the list of subdirectories in the expression directory
+    expression_files = [entry for entry in os.listdir(expression_dir) if os.path.isdir(os.path.join(expression_dir, entry))]
+    expression_files.sort()
+
+    # Process each sample
+    for sample in expression_files:
+        samples.append(sample)
+        gtf_file_path = os.path.join(expression_dir, sample, f"{sample}_express.gtf")
+
+        try:
+            with open(gtf_file_path, "r") as gtf_file:
+                lines = gtf_file.readlines()
+                for line in lines:
+                    if line.startswith("#"): #Skip comment lines
+                        continue
+                    fields = line.strip().split("\t")
+                    if fields[2] == "transcript":
+                        attributes = fields[8].split('"')
+                        transcript_info = f"{attributes[1]},{attributes[3]}"
+
+                        # Check for missing TPM values
+                        if 'TPM' not in attributes[-3]:
+                            print(f"Error: Missing TPM value in {sample} for {transcript_info}")
+                            if transcript_info not in tpm_data:
+                                tpm_data[transcript_info] = "NA"
+                                fpkm_data[transcript_info] = "NA"
+                            else:
+                                tpm_data[transcript_info] += ",NA"
+                                fpkm_data[transcript_info] += ",NA"
+                        else:
+                            tpm_value = attributes[-2]
+                            fpkm_value = attributes[-4]
+                            if transcript_info not in tpm_data:
+                                tpm_data[transcript_info] = tpm_value
+                                fpkm_data[transcript_info] = fpkm_value
+                            else:
+                                tpm_data[transcript_info] += f",{tpm_value}"
+                                fpkm_data[transcript_info] += f",{fpkm_value}"
+
+        except FileNotFoundError:
+            print(f"Error: File {gtf_file_path} not found.")
+        except Exception as e:
+            print(f"An unexpected error occurred while processing {gtf_file_path}: {e}")
+
+    # Generate the output CSV paths
+    tpm_csv_path = os.path.join(expression_dir, "0_TPM.csv")
+    fpkm_csv_path = os.path.join(expression_dir, "0_FPKM.csv")
+
+    try:
+        # Write TPM data to CSV
+        with open(tpm_csv_path, "w") as tpm_file, open(fpkm_csv_path, "w") as fpkm_file:
+            header = "gene_id,transcript_id"
+            tpm_file.write(header)
+            fpkm_file.write(header)
+
+            # Write sample names to the header
+            for sample in samples:
+                tpm_file.write(f",{sample}")
+                fpkm_file.write(f",{sample}")
+
+            # Write transcript data
+            for transcript_info, tpm_values in tpm_data.items():
+                fpkm_values = fpkm_data.get(transcript_info, "NA")
+                tpm_file.write(f"\n{transcript_info},{tpm_values}")
+                fpkm_file.write(f"\n{transcript_info},{fpkm_values}")
+
+        print(f"TPM and FPKM data successfully written to {tpm_csv_path} and {fpkm_csv_path}.")
+
+    except Exception as e:
+        print(f"An error occurred while writing CSV files: {e}")
+
+def calculate_read_count(count_dir: str) -> None:
+    """
+    Runs the 'prepDE.py' script to calculate read counts for gene and transcript 
+    expression. It assumes that the necessary files for the script are located 
+    in the '3_assembly/expression' directory and writes output to '4_count' directory.    
+    Args:
+        count_dir (str): The directory where count results will be saved.
+    Raises:
+        subprocess.CalledProcessError: If the 'prepDE.py' script fails during execution.
+        FileNotFoundError: If the required files or directories are missing.
+    """
+    count_dir = Path(count_dir)
+    count_dir.mkdir(exist_ok=True)
+    try:
+        subprocess.run(["python3", "library/prepDE.py", "-i", "3_assembly/expression", 
+                        "-g", "4_count/gene_count.csv", "-t", "4_count/transcript_count.csv"], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running prepDE.py: {e}")
+    except FileNotFoundError as e:
+        print(f"File not found: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+def gtf_to_csv(gtf_file: str, csv_file: str) -> None:
+    """
+    Converts a GTF file to a CSV format containing gene and transcript information. 
+    This function extracts relevant fields such as chromosome, feature, start, end, 
+    strand, gene_id, and transcript_id, and writes them to a CSV file.
+    Args:
+        gtf_file (str): Path to the input GTF file to be processed.
+        csv_file (str): Path to the output CSV file where data will be written.
+        
+    Raises:
+        FileNotFoundError: If the provided GTF file is not found.
+        Exception: If there is an error processing the GTF file.
+    """
+    try:
+        with open(gtf_file, 'r') as gtf, open(csv_file, 'w') as csv:
+            csv.write("chrom,feature,start,end,strand,gene_id,transcript_id\n")
+            for line in gtf:
+                if line.startswith("#"):  # Skip comment lines
+                    continue
+                fields = line.strip().split("\t")
+                if len(fields) < 9:  # Ensure we have all expected fields
+                    continue
+                chrom, feature, start, end, strand, attributes = fields[0], fields[2], fields[3], fields[4], fields[6], fields[8]
+
+                gene_id = transcript_id = None
+                for attr in attributes.split(";"):
+                    if "gene_id" in attr:
+                        gene_id = attr.split('"')[1]
+                    if "transcript_id" in attr:
+                        transcript_id = attr.split('"')[1]
+
+                # Write to CSV if both gene_id and transcript_id are found
+                if gene_id and transcript_id:
+                    csv.write(f"{chrom},{feature},{start},{end},{strand},{gene_id},{transcript_id}\n")
+                else:
+                    print(f"Missing gene_id or transcript_id in line: {line}")
+    except FileNotFoundError:
+        print(f"File {gtf_file} not found.")
+    except Exception as e:
+        print(f"An error occurred while processing the GTF file: {e}")
+
+def classify_trans(csv_file: str, output_file: str, min_overlap_length: int) -> None:
+    """
+    Classifies novel and annotated transcripts based on their overlap and exon comparison.
+    This function groups transcripts by chromosome, checks for overlap between novel and 
+    annotated transcripts, and compares their exons. The results are written to a CSV file. 
+    Args:
+        csv_file (str): Path to the input CSV file containing transcript and exon data.
+        output_file (str): Path to the output CSV file where results will be saved.
+        min_overlap_length (int): Minimum overlap length (in base pairs) required for classification.
+    Returns:
+        None: The results are written to an output CSV file.
+    """
+    # Read input CSV file into a DataFrame
+    df = pd.read_csv(csv_file)
+    classification_results = []
+
+    def overlap(start1: int, end1: int, start2: int, end2: int, min_length: int) -> tuple:
+        """
+        Checks if two genomic intervals overlap and calculates the overlap length.
+        Args:
+            start1 (int): Start position of the first interval.
+            end1 (int): End position of the first interval.
+            start2 (int): Start position of the second interval.
+            end2 (int): End position of the second interval.
+            min_length (int): Minimum required overlap length for classification.
+        Returns:
+            tuple: A tuple (overlap_result, overlap_length) where
+                   overlap_result is a boolean indicating if the overlap meets the minimum length,
+                   overlap_length is the length of the overlap.
+        """
+        overlap_start = max(start1, start2)
+        overlap_end = min(end1, end2)
+        overlap_length = max(0, overlap_end - overlap_start)
+        return overlap_length >= min_length, overlap_length
+
+    def compare_exons(novel_exons, annotated_exons) -> tuple:
+        """
+        Compares exons between novel and annotated transcripts.
+        Args:
+            novel_exons (pd.DataFrame): DataFrame containing exon information for novel transcripts.
+            annotated_exons (pd.DataFrame): DataFrame containing exon information for annotated transcripts.
+        Returns:
+            tuple: A tuple (novel_exon_count, annotated_exon_count, shared_exons) where
+                   novel_exon_count is the number of exons in novel transcripts,
+                   annotated_exon_count is the number of exons in annotated transcripts,
+                   shared_exons is the number of exons shared between the novel and annotated transcripts.
+        """
+        shared_exons = 0
+        for _, novel_exon in novel_exons.iterrows():
+            for _, annotated_exon in annotated_exons.iterrows():
+                if novel_exon['start'] == annotated_exon['start'] and novel_exon['end'] == annotated_exon['end']:
+                    shared_exons += 1
+        return len(novel_exons), len(annotated_exons), shared_exons
+
+    # Group transcripts by chromosome
+    for chrom, group in df.groupby('chrom'):
+        # Identify novel and annotated transcripts and exons
+        novel_transcripts = group[(group['feature'] == 'transcript') & (group['transcript_id'].str.startswith('MSTRG'))]
+        annotated_transcripts = group[(group['feature'] == 'transcript') & (~group['transcript_id'].str.startswith('MSTRG'))]
+        novel_exons = group[(group['feature'] == 'exon') & (group['transcript_id'].str.startswith('MSTRG'))]
+        annotated_exons = group[(group['feature'] == 'exon') & (~group['transcript_id'].str.startswith('MSTRG'))]
+
+        # Process each novel transcript
+        for _, novel in novel_transcripts.iterrows():
+            overlap_found = False
+            for _, annotated in annotated_transcripts.iterrows():
+                # Check for overlap between novel and annotated transcripts
+                overlap_result, overlap_length = overlap(novel['start'], novel['end'], annotated['start'], annotated['end'], min_overlap_length)
+                if overlap_result:
+                    overlap_found = True
+                    # Compare exons
+                    novel_exons_filtered = novel_exons[novel_exons['transcript_id'] == novel['transcript_id']]
+                    annotated_exons_filtered = annotated_exons[annotated_exons['transcript_id'] == annotated['transcript_id']]
+                    novel_exon_count, annotated_exon_count, shared_exons = compare_exons(novel_exons_filtered, annotated_exons_filtered)
+                    # Classify based on strand orientation
+                    classification = 'Overlap' if novel['strand'] == annotated['strand'] else 'Antisense'
+                    classification_results.append((novel['transcript_id'], annotated['transcript_id'], classification,
+                        overlap_length, novel_exon_count, annotated_exon_count, shared_exons))
+
+            if not overlap_found:
+                # If no overlap found, classify as intergenic
+                novel_exon_count = len(novel_exons[novel_exons['transcript_id'] == novel['transcript_id']])
+                classification_results.append((novel['transcript_id'], "NA", "Intergenic", 0, novel_exon_count, "NA", "NA"))
+
+    # Save classification results to a DataFrame and write to CSV
+    results_df = pd.DataFrame(classification_results, columns=[
+            'Novel_Transcript_ID', 'Annotated_Transcript_ID', 'Classification',
+            'Overlap_length', 'Novel_Exons', 'Annotated_Exons', 'Shared_Exons'])
+    results_df.to_csv(output_file, index=False)
+    print(f"Classification results successfully written to {output_file}")
+
+def classify_transcripts(class_dir: str, gtf_file: str, csv_file: str, output_file: str, min_overlap: int) -> None:
+    """
+    Classifies the transcripts by converting a GTF file to CSV format and then calling 
+    the classification function to process the data.    
+    Args:
+        class_dir (str): Directory to store the CSV and classification results.
+        gtf_file (str): Path to the GTF file to be converted to CSV.
+        csv_file (str): Name of the output CSV file.
+        output_file (str): Path to save the output classification results.
+        min_overlap (int): Minimum overlap required for transcript classification.
+    """
+    class_dir = Path(class_dir)
+    class_dir.mkdir(exist_ok=True)  # Ensure the directory exists
+
+    # Convert GTF file to CSV
+    gtf_to_csv(gtf_file, f"{class_dir}/{csv_file}")
+
+    # Classify transcripts based on the CSV file
+    classify_trans(f"{class_dir}/{csv_file}", f"{class_dir}/{output_file}", min_overlap)
+
+def move_output(output: str) -> None:
+    """
+    Moves all files, except initial scripts and directories, into the specified output directory.
+    Args:
+        output (str): The target output directory where files should be moved.
+    """
+    output = "./output" if output == "." else output
+    output = Path(output)
+    output.mkdir(exist_ok=True)  # Ensure the output directory exists
+    initial_script = ["ZRNA_seq", "README.md", "reference", "library", output.name]
+
+    # Move all files that are not part of the initial script or directories
+    for entry in os.listdir("."):
+        if entry not in initial_script:
+            source_path = Path(entry)
+            target_path = output / entry
+
+            # Avoid overwriting files if they already exist in the target
+            if not target_path.exists():
+                shutil.move(source_path, target_path)
+            else:
+                print(f"Skipping {entry}, it already exists in the target directory.")
+
+def main():
+    # Parse arguments and check the steps to execute
+    args = parse_arguments()
+    extraction_enabled, trim_enabled, map_enabled, assemble_enabled, cleanup_enabled = check_points(args.output, args.step)
+
+    # Extraction step
+    if extraction_enabled and args.query != "0_raw_reads":
+        print("Start extraction")
+        extract_files(args.query, args.thread)
+        relocate_files(args.query, "0_raw_reads", args.thread)
+
+    # Trimming step
+    if trim_enabled:
+        print("Start trimming")
+        if args.adapter == "Sample_UDI.csv" and args.library == 'stranded':
+            adapter = generate_adapter("UDI.csv", args.adapter)
+        else:
+            adapter = adapter_extract(args.adapter, args.library, '0_raw_reads')
+        trim_script = trimming(adapter, '0_raw_reads', "1_trim", "1_trim/run.sh", args.library)
+        command_per_sample = 5 if args.library == 'stranded' else 11
+        run_commands_in_parallel(trim_script, args.thread, command_per_sample)
+        trimming_qc("1_trim", args.library)
+
+    # Mapping step
+    if map_enabled:
+        print("Start mapping")
+        if args.reference not in os.listdir("./reference") or not any(file.endswith(".ht2") for file in os.listdir(f"./reference/{args.reference}")):
+            generate_hisat2_reference(args.ref_fasta, args.ref_gff, args.reference, args.thread)
+        create_and_run_mapping_script("1_trim", "2_map", "2_map/run.sh", args.reference, args.thread, args.library)
+        generate_mapping_summary("2_map", "2_map/0_mapping_summary.csv")
+
+        if args.library == 'non_stranded':
+            extract_gene_lengths(f"./reference/{args.reference}/{args.reference}.gff", "2_map/0_ref_gene_length.csv")
+            calculate_fpkm_and_summarize("2_map", "2_map/0_fpkm_summ.csv")
+            summarize_count_data("2_map", "2_map/0_count_summ.csv")
+            calculate_tpm_fpkm("2_map/0_count_summ.csv", "2_map/0_ref_gene_length.csv", "2_map/1_TPM.csv", "2_map/1_FPKM.csv")
+
+    # Assembly step (for stranded library)
+    if assemble_enabled and args.library == 'stranded':
+        print("Start assembly")
+        run_assembly_pipeline("2_map", "3_assembly", "3_assembly/expression", args.reference, args.thread)
+        summarize_transcripts("3_assembly", "3_assembly/3_assembly.summ")
+        process_expression_data("3_assembly/expression")
+
+    # Calculate read count
+    if args.raw_count and args.library == 'stranded':
+        print("Start calculating read count")
+        calculate_read_count("4_count")
+
+    # Transcript classification step
+    if args.classification and args.library == 'stranded':
+        print("Start transcript classification")
+        classify_transcripts("5_classification", "3_assembly/1_stringtie_merged.gtf", "0_stringtie_merged.csv",
+                             "1_transcript_classification.csv", args.min_overlap)
+
+    # Cleanup step
+    if cleanup_enabled:
+        print("Start cleaning")
+        move_output(args.output)
+
+    print("All done!")
+
+if __name__ == "__main__":
+    main()
+ 
