@@ -39,14 +39,14 @@ Table of Contents
 	ZRNA_seq -lib {stranded,non_stranded} -q query -r reference 
 	[-h help] [-@ thread] [-a adapter] [-st step] [-rc raw_count] [-c classification] 
 	[-m min_overlap] [-o output] [-rq ref_fasta] [-rg ref_gff] [-v version] [-V verbose]
-- The pipeline consists of several steps that can be executed in sequence, depending on the chosen options. The available steps:
-    	+ Extraction: Extract files from raw data.
+- The pipeline consists of several steps that can be executed in sequence:
+	+ Extraction: Extract files from raw data.
 	+ Trimming: Trim adapters and low-quality bases.
 	+ Mapping: Align reads to a reference genome.
 	+ Assembly: Perform transcript assembly using StringTie.
-    	+ Expression Analysis: Calculate gene and transcript expression (TPM/FPKM).
-    	+ Read Count Calculation: Calculate the read count for each gene.
-    	+ Transcript Classification: Classify novel transcripts based on overlap and exon count.
+	+ Expression Analysis: Calculate gene and transcript expression (TPM/FPKM).
+	+ Read Count Calculation: Calculate the read count for each gene.
+	+ Transcript Classification: Classify novel transcripts based on overlap and exon count.
 - The adapter file must follow the format shown below. 
 	+ A header is required
 	+ The sample names should match those in the input folder containing the FASTQ files.
