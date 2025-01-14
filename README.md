@@ -35,7 +35,7 @@ RNA-Seq Data Analysis Pipeline
 	+ bedtools --help
 
 3. Usage
-- To run the pipeline, run the script.py:
+- To run the pipeline, run the script:
 	ZRNA_seq -lib {stranded,non_stranded} -q query -r reference 
 	[-h help] [-@ thread] [-a adapter] [-st step] [-rc raw_count] [-c classification] 
 	[-m min_overlap] [-o output] [-rq ref_fasta] [-rg ref_gff] [-v version] [-V verbose]
