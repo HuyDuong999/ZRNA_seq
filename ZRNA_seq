@@ -1302,7 +1302,7 @@ def main():
 
         if args.library == 'non_stranded':
             extract_gene_lengths(f"./reference/{args.reference}/{args.reference}.gff", "2_map/0_ref_gene_length.csv")
-            calculate_fpkm_and_summarize("2_map", "2_map/0_fpkm_summ.csv")
+            #calculate_fpkm_and_summarize("2_map", "2_map/0_fpkm_summ.csv")
             summarize_count_data("2_map", "2_map/0_count_summ.csv")
             calculate_tpm_fpkm("2_map/0_count_summ.csv", "2_map/0_ref_gene_length.csv", "2_map/1_TPM.csv", "2_map/1_FPKM.csv")
 
