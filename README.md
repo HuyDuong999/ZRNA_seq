@@ -36,9 +36,9 @@ Table of Contents
 
 3. Usage
 - To run the pipeline, run the script.py:
-	ZRNA_seq -lib {stranded,non_stranded} -q QUERY -r REFERENCE 
-	[-h HELP] [-@ THREAD] [-a ADAPTER] [-st STEP] [-rc RAW_COUNT] [-c CLASSSIFICATION] 
-	[-m MIN_OVERLAP] [-o OUTPUT] [-rq REF_FASTA] [-rg REF_GFF] [-v VERSION] [-V VERBOSE]
+	ZRNA_seq -lib {stranded,non_stranded} -q query -r reference 
+	[-h help] [-@ thread] [-a adapter] [-st step] [-rc raw_count] [-c classification] 
+	[-m min_overlap] [-o output] [-rq ref_fasta] [-rg ref_gff] [-v version] [-V verbose]
 - The pipeline consists of several steps that can be executed in sequence, depending on the chosen options. The available steps are:
     	+ Extraction: Extract files from raw data.
 	+ Trimming: Trim adapters and low-quality bases.
