@@ -7,12 +7,12 @@ RNA-Seq Data Analysis Pipeline
 - Any quetion or bugs, please contact me at tienquanghuy.duong@ntu.edu.sg.
 
 Table of Contents
-    - Installation
-    - Requirements
-    - Usage
-    - Directory Structure
-    - Troubleshooting
-    - License
+	- Installation
+	- Requirements
+ 	- Usage
+	- Directory Structure
+	- Troubleshooting
+	- License
 
 1. Installation
 - Clone the repository to your local machine:
@@ -28,11 +28,11 @@ Table of Contents
 - Install the necessary dependencies (e.g., pandas):
 	pip install pandas
 - Ensure that all the required tools are available in your system path:
-	trim_galore --help
-	hisat2 --help
-	stringtie --help
-	samtools --help
-	bedtools --help
+	+ trim_galore --help
+	+ hisat2 --help
+	+ stringtie --help
+	+ samtools --help
+	+ bedtools --help
 
 3. Usage
 - To run the pipeline, run the script.py:
