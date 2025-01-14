@@ -39,7 +39,7 @@ Table of Contents
 	ZRNA_seq -lib {stranded,non_stranded} -q query -r reference 
 	[-h help] [-@ thread] [-a adapter] [-st step] [-rc raw_count] [-c classification] 
 	[-m min_overlap] [-o output] [-rq ref_fasta] [-rg ref_gff] [-v version] [-V verbose]
-- The pipeline consists of several steps that can be executed in sequence, depending on the chosen options. The available steps are:
+- The pipeline consists of several steps that can be executed in sequence, depending on the chosen options. The available steps.
     	+ Extraction: Extract files from raw data.
 	+ Trimming: Trim adapters and low-quality bases.
 	+ Mapping: Align reads to a reference genome.
