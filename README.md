@@ -6,7 +6,7 @@ RNA-Seq Data Analysis Pipeline
 - This pipeline is for performing a series of tasks, including file extraction, trimming, alignment, assembly, expression analysis, and transcript classification. 
 - Any quetion or bugs, please contact me at tienquanghuy.duong@ntu.edu.sg.
 
-Table of Contents
+- Table of Contents:
 	- Installation
 	- Requirements
  	- Usage
@@ -54,8 +54,7 @@ Table of Contents
 		+ Sample,i7_index,i5_index
 		+ Sample1,TGATTATACG,GTCGATTACA
 		+ Sample2,CAGCCGCGTA,ACTAGCCGTG
-		+ .............................
-
+  
 4. Directory Structure
 - After running the pipeline, the following directory structure will be generated in final directory:
 	+ 0_raw_reads: Directory where the extracted raw reads are stored.
