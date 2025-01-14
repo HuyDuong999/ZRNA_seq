@@ -51,10 +51,10 @@ Table of Contents
 	+ A header is required
 	+ The sample names should match those in the input folder containing the FASTQ files.
 	+ Format:
-	Sample,i7_index,i5_index
-	Sample1,TGATTATACG,GTCGATTACA
-	Sample2,CAGCCGCGTA,ACTAGCCGTG
-	.............................
+		Sample,i7_index,i5_index
+		Sample1,TGATTATACG,GTCGATTACA
+		Sample2,CAGCCGCGTA,ACTAGCCGTG
+		.............................
 
 4. Directory Structure
 - After running the pipeline, the following directory structure will be generated in final directory:
