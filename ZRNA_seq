@@ -1293,7 +1293,9 @@ def main():
     # Mapping step
     if map_enabled:
         print("Start mapping")
-        if args.reference not in os.listdir("./reference") or not any(file.endswith(".ht2") for file in os.listdir(f"./reference/{args.reference}")):
+        reference_dir = Path("./reference")
+        reference_dir.mkdir(exist_ok=True)
+        if args.reference not in os.listdir(reference_dir) or not any(file.endswith(".ht2") for file in os.listdir(f"./reference/{args.reference}")):
             generate_hisat2_reference(args.ref_fasta, args.ref_gff, args.reference, args.thread)
         create_and_run_mapping_script("1_trim", "2_map", "2_map/run.sh", args.reference, args.thread, args.library)
         generate_mapping_summary("2_map", "2_map/0_mapping_summary.csv")
