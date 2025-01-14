@@ -347,7 +347,7 @@ def trimming(adapter, input_dir: str, output_dir: str, trim_script: str, library
                         smartseq1 = "AAGCAGTGGTATCAACGCAGAGTACATGGG"
                         smartseq2 = "CCCATGTACTCTGCGTTGATACCACTGCTT"
                         w.write(f"trim_galore -q 20 --phred33 -a {adapter_seq[0]} -a2 {adapter_seq[1]} --stringency 5 --trim-n -e 0.2 -o {output_dir} --length 35 --paired {file_1} {file_2}\n")
-                        for n in range(1, 5):
+                        for n in range(1, 3):
                             w.write(f"trim_galore -q 20 --phred33 -a {smartseq1} -a2 {smartseq2} --stringency 5 --trim-n -e 0.2 -o {output_dir} --length 35 --paired {output_dir}/{sample}{'_1_val'*n}_1.fq.gz {output_dir}/{sample}{'_2_val'*n}_2.fq.gz\n")
                             w.write(f"rm {output_dir}/{sample}{'_1_val'*n}_1.fq.gz {output_dir}/{sample}{'_2_val'*n}_2.fq.gz\n")
                         w.write(f"mv {output_dir}/{sample}{'_1_val'*(n+1)}_1.fq.gz {output_dir}/{sample}_trimmed_1.fq.gz\n")
