@@ -56,7 +56,7 @@ def parse_arguments():
     parser.add_argument('-a', '--adapter', type=str,
         help="Path to the file with adapter sequences for each sample.")
     parser.add_argument('-r', '--reference', type=str, required=True,
-        help=("Specify the available genome ('pf_3d7', 'pk_a1h1', 'pk_h', 'pv_p01', 'monkey', 'human')."
+        help=("Specify the available genome if you have created."
             "Or provide a custom reference name for creation with --ref_fasta and --ref_gff."))
     parser.add_argument('-st', '--step', choices=['all', 'trim', 'map', 'assemble', 'cleanup'], default='all',
         help="Step to run from (default: 'all').")
